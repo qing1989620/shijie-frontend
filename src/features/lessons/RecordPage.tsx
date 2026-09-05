@@ -36,6 +36,7 @@ export default function RecordPage() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const vadTimerRef = useRef<number | null>(null);
   const speakingRef = useRef(false);
+  const chunksRef = useRef<Blob[]>([]); // 真实录音分片——结束后的最终转写依赖它
 
   // 查询 ASR Provider：mock 时展示"模拟转写"提示
   useEffect(() => {
@@ -110,8 +111,10 @@ export default function RecordPage() {
         const recorder = new MediaRecorder(streamRef.current!);
         recorderRef.current = recorder;
         recorder.ondataavailable = async (e) => {
-          // 静音分片不发送；说话分片携带真实音频(接入 FunASR 后即为真实转写)
-          if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && speakingRef.current) {
+          if (e.data.size === 0) return;
+          chunksRef.current.push(e.data); // 无论说话与否都留存（最终转写需要完整音频）
+          // 静音分片不发送；说话分片携带真实音频(mock 忽略内容，云识别用于逐片场景)
+          if (ws.readyState === WebSocket.OPEN && speakingRef.current) {
             const data = await toBase64(e.data);
             ws.send(JSON.stringify({ type: "audio.chunk", version: 1, timestamp: new Date().toISOString(), payload: { data } }));
           }
@@ -189,10 +192,17 @@ export default function RecordPage() {
     }
 
     setFinalize("running");
-    // 上传完整音频做最终校准转写（final pass）——带认证
-    const blob = new Blob([""], { type: "audio/webm" });
+    // 上传真实完整录音做最终转写（final pass）——带认证
+    const mimeType = recorderRef.current?.mimeType || "audio/webm";
+    const blob = new Blob(chunksRef.current, { type: mimeType });
+    if (blob.size < 1024) {
+      setFinalize("failed");
+      setErrorMsg("没有录到有效声音（麦克风静音或未说话）。请检查麦克风后重试。");
+      return;
+    }
+    const ext = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "m4a" : "webm";
     const form = new FormData();
-    form.append("file", blob, "lesson-final.webm");
+    form.append("file", blob, `lesson-final.${ext}`);
     const apiBase = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
     const res = await fetch(`${apiBase}/lessons/${lessonId}/recordings`, {
       method: "POST",
@@ -267,7 +277,12 @@ export default function RecordPage() {
           {asrMock && recording && (
             <p className="mb-3 rounded-md bg-amber-soft px-3 py-2 text-[12.5px] leading-relaxed text-amber-accent">
               开发模式 · 模拟转写：下方文字是预设课堂内容的演示，不代表你的真实语音——只有你说话时才会推进。
-              接入自托管 FunASR（ASR_PROVIDER=funasr）后，这里就是真实转写。
+              在 .env 配置 ASR_PROVIDER=openai_compatible（硅基流动等云识别）或 funasr 后即为真实转写。
+            </p>
+          )}
+          {!asrMock && recording && (
+            <p className="mb-3 rounded-md bg-brand-50 px-3 py-2 text-[12.5px] leading-relaxed text-brand-700">
+              真实识别模式：实时区不做逐句显示，结束录音后系统会把完整音频交给识别服务，转写自动出现在课堂详情。
             </p>
           )}
           <div className="flex items-center gap-4">
