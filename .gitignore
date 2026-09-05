@@ -10,3 +10,4 @@ e2e/screenshots/
 coverage/
 
 .DS_Store
+vite.config.ts.timestamp-*.mjs
