@@ -24,6 +24,8 @@ export default function RecordPage() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [items, setItems] = useState<TranscriptItem[]>([]);
   const [finalize, setFinalize] = useState<"idle" | "running" | "done" | "failed">("idle");
+  const [asrMock, setAsrMock] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -31,6 +33,17 @@ export default function RecordPage() {
   const timerRef = useRef<number | null>(null);
   const startingRef = useRef(false); // 双击/重复点击防护
   const closedRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const vadTimerRef = useRef<number | null>(null);
+  const speakingRef = useRef(false);
+
+  // 查询 ASR Provider：mock 时展示"模拟转写"提示
+  useEffect(() => {
+    api
+      .GET("/meta/version")
+      .then(({ data }) => setAsrMock(data?.asr_provider === "mock"))
+      .catch(() => {});
+  }, []);
 
   const start = async () => {
     if (startingRef.current || recording) return; // 防重复启动
@@ -69,11 +82,38 @@ export default function RecordPage() {
       ws.send(JSON.stringify({ type: "session.start", version: 1, timestamp: new Date().toISOString(), payload: { ticket: ticket.ticket } }));
       // 4) 开录
       try {
+        // 麦克风音量检测(VAD)：只有真正说话时才发分片——静音时不产生转写
+        const audioCtx = new AudioContext();
+        audioCtxRef.current = audioCtx;
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        audioCtx.createMediaStreamSource(streamRef.current!).connect(analyser);
+        const buf = new Uint8Array(analyser.fftSize);
+        vadTimerRef.current = window.setInterval(() => {
+          analyser.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const v = (buf[i] - 128) / 128;
+            sum += v * v;
+          }
+          speakingRef.current = Math.sqrt(sum / buf.length) > 0.035;
+          setSpeaking(speakingRef.current);
+        }, 200);
+
+        const toBase64 = (blob: Blob) =>
+          new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
+            reader.readAsDataURL(blob);
+          });
+
         const recorder = new MediaRecorder(streamRef.current!);
         recorderRef.current = recorder;
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "audio.chunk", version: 1, timestamp: new Date().toISOString(), payload: {} }));
+        recorder.ondataavailable = async (e) => {
+          // 静音分片不发送；说话分片携带真实音频(接入 FunASR 后即为真实转写)
+          if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && speakingRef.current) {
+            const data = await toBase64(e.data);
+            ws.send(JSON.stringify({ type: "audio.chunk", version: 1, timestamp: new Date().toISOString(), payload: { data } }));
           }
         };
         recorder.start(1000); // 1s chunks
@@ -121,6 +161,13 @@ export default function RecordPage() {
       timerRef.current = null;
     }
     setRecording(false);
+    setSpeaking(false);
+    if (vadTimerRef.current) {
+      clearInterval(vadTimerRef.current);
+      vadTimerRef.current = null;
+    }
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
     recorderRef.current?.stop();
     streamRef.current?.getTracks().forEach((t) => t.stop());
 
@@ -173,6 +220,8 @@ export default function RecordPage() {
   useEffect(
     () => () => {
       if (timerRef.current) clearInterval(timerRef.current);
+      if (vadTimerRef.current) clearInterval(vadTimerRef.current);
+      audioCtxRef.current?.close().catch(() => {});
       streamRef.current?.getTracks().forEach((t) => t.stop());
       wsRef.current?.close();
     },
@@ -204,11 +253,23 @@ export default function RecordPage() {
                 aria-label={recording ? "正在录音" : "未在录音"}
               />
               <span className="text-[13px] text-ink-500">{recording ? "正在录音" : "未在录音"}</span>
+              {recording && (
+                <span
+                  className={cn("inline-block h-2 w-2 rounded-full", speaking ? "bg-green-ink" : "bg-ink-200")}
+                  aria-label={speaking ? "检测到说话" : "未检测到声音"}
+                />
+              )}
               <Badge tone={connBadge.tone}>{connBadge.label}</Badge>
             </span>
           }
         />
         <div className="p-5">
+          {asrMock && recording && (
+            <p className="mb-3 rounded-md bg-amber-soft px-3 py-2 text-[12.5px] leading-relaxed text-amber-accent">
+              开发模式 · 模拟转写：下方文字是预设课堂内容的演示，不代表你的真实语音——只有你说话时才会推进。
+              接入自托管 FunASR（ASR_PROVIDER=funasr）后，这里就是真实转写。
+            </p>
+          )}
           <div className="flex items-center gap-4">
             <span className="font-serif text-4xl tabular-nums">{formatMs(elapsed)}</span>
             {recording ? (

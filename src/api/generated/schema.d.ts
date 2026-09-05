@@ -1275,6 +1275,11 @@ export interface components {
             contract_version: string;
             /** App Env */
             app_env: string;
+            /**
+             * Asr Provider
+             * @default mock
+             */
+            asr_provider: string;
         };
         /** OcrPreviewOut */
         OcrPreviewOut: {
